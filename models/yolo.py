@@ -504,6 +504,40 @@ class IBin(nn.Module):
         yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
+class Polygon_Detect(Detect):
+    # Polygon_Detect class for polygon anchor boxes
+    stride = None  # strides computed during build
+    onnx_dynamic = False  # ONNX export parameter
+
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer for polygon
+        super(Polygon_Detect, self).__init__(nc, anchors, ch)        
+        self.no = nc + 9  # number of outputs per anchor
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.inplace = inplace
+
+    def forward(self, x):
+        # x = x.copy()  # for profiling
+        z = []  # inference output
+        for i in range(self.nl):
+            x[i] = self.m[i](x[i])  # conv
+            bs, _, ny, nx = x[i].shape  # x(bs,267,20,20) to x(bs,3,20,20,89)
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+
+            if not self.training:  # inference
+                if self.grid[i].shape[2:4] != x[i].shape[2:4] or self.onnx_dynamic:
+                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+
+                y = x[i].clone()
+                y[..., 8:] = y[..., 8:].sigmoid()
+                # y[..., 8], y[..., 9:] = y[..., 8].sigmoid(), y[..., 9:].softmax(dim=-1)    # softmax loss for classes
+                if self.inplace:
+                    y[..., :8] = (y[..., :8] + self.grid[i].repeat((1, 1, 1, 1, 4))) * self.stride[i]  # xyxyxyxy
+                else:
+                    xyxyxyxy = (y[..., :8] + self.grid[i].repeat((1, 1, 1, 1, 4))) * self.stride[i]  # xyxyxyxy
+                    y = torch.cat((xyxyxyxy, y[..., 8:]), -1)
+                z.append(y.view(bs, -1, self.no))
+                
+        return x if self.training else (torch.cat(z, 1), x)
 
 class Model(nn.Module):
     def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
@@ -732,12 +766,70 @@ class Model(nn.Module):
     def info(self, verbose=False, img_size=640):  # print model information
         model_info(self, verbose, img_size)
 
+class Polygon_Model(Model):
+    # Polygon_Model class for model with polygon anchor boxes
+    def __init__(self, cfg='polygon_yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
+        super(Polygon_Model, self).__init__(cfg, ch, nc, anchors)
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
+    def _descale_pred(self, p, flips, scale, img_size):
+        # de-scale predictions following augmented inference (inverse operation)
+        if self.inplace:
+            p[..., :8] /= scale  # de-scale
+            if flips == 2:
+                p[..., 1:8:2] = img_size[0] - p[..., 1:8:2]  # de-flip ud
+            elif flips == 3:
+                p[..., 0:8:2] = img_size[1] - p[..., 0:8:2]  # de-flip lr
+        else:
+            xyxyxyxy = p[..., :8] / scale  # de-scale
+            if flips == 2:
+                xyxyxyxy[...,1:8:2] = img_size[0] - xyxyxyxy[...,1:8:2]  # de-flip ud
+            elif flips == 3:
+                xyxyxyxy[...,0:8:2] = img_size[1] - xyxyxyxy[...,0:8:2]  # de-flip lr
+            p = torch.cat((xyxyxyxy, p[..., 8:]), -1)
+        return p
+    
+    def _initialize_biases(self, cf=None):  # initialize biases into Polygon_Detect(), cf is class frequency
+        # https://arxiv.org/abs/1708.02002 section 3.3
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
+        m = self.model[-1]  # Polygon_Detect() module
+        for mi, s in zip(m.m, m.stride):  # from
+            b = mi.bias.view(m.na, -1)  # conv.bias(267) to (3,89)
+            b.data[:, 8] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+            b.data[:, 9:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+    def _print_biases(self):
+        m = self.model[-1]  # Polygon_Detect() module
+        for mi in m.m:  # from
+            b = mi.bias.detach().view(m.na, -1).T  # conv.bias(267) to (3,89)
+            logger.info(
+                ('%6g Conv2d.bias:' + '%10.3g' * 10) % (mi.weight.shape[1], *b[:9].mean(1).tolist(), b[9:].mean()))
+
+    def nms(self, mode=True):  # add or remove Polygon_NMS module
+        present = type(self.model[-1]) is Polygon_NMS  # last layer is Polygon_NMS
+        if mode and not present:
+            logger.info('Adding Polygon_NMS... ')
+            m = Polygon_NMS()  # module
+            m.f = -1  # from
+            m.i = self.model[-1].i + 1  # index
+            self.model.add_module(name='%s' % m.i, module=m)  # add
+            self.eval()
+        elif not mode and present:
+            logger.info('Removing Polygon_NMS... ')
+            self.model = self.model[:-1]  # remove
+        return self
+
+    def autoshape(self):  # add Polygon_AutoShape module
+        logger.info('Adding Polygon_AutoShape... ')
+        m = Polygon_AutoShape(self)  # wrap model
+        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
+        return m
+
+def parse_model(d, ch, polygon=False):  # model_dict, input_channels(3)
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    no = (na * (nc + 5)) if not polygon else (na * (nc + 9))   # number of outputs = anchors * (classes + 5)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
@@ -787,7 +879,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f[0]]
         elif m is Foldcut:
             c2 = ch[f] // 2
-        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
+        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint, Polygon_Detect]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

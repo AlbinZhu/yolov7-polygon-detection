@@ -25,6 +25,25 @@ from utils.metrics import fitness
 matplotlib.rc('font', **{'size': 11})
 matplotlib.use('Agg')  # for writing to files only
 
+class Colors:
+    # Ultralytics color palette https://ultralytics.com/
+    def __init__(self):
+        # hex = matplotlib.colors.TABLEAU_COLORS.values()
+        hex = ('FF3838', 'FF9D97', 'FF701F', 'FFB21D', 'CFD231', '48F90A', '92CC17', '3DDB86', '1A9334', '00D4BB',
+               '2C99A8', '00C2FF', '344593', '6473FF', '0018EC', '8438FF', '520085', 'CB38FF', 'FF95C8', 'FF37C7')
+        self.palette = [self.hex2rgb('#' + c) for c in hex]
+        self.n = len(self.palette)
+
+    def __call__(self, i, bgr=False):
+        c = self.palette[int(i) % self.n]
+        return (c[2], c[1], c[0]) if bgr else c
+
+    @staticmethod
+    def hex2rgb(h):  # rgb order (PIL)
+        return tuple(int(h[1 + i:1 + i + 2], 16) for i in (0, 2, 4))
+
+
+colors = Colors()  # create instance for 'from utils.plots import colors'
 
 def color_list():
     # Return first 10 plt colors as (r,g,b) https://stackoverflow.com/questions/51350872/python-from-color-name-to-rgb
@@ -189,6 +208,81 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
         Image.fromarray(mosaic).save(fname)  # PIL save
     return mosaic
 
+def polygon_plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=640, max_subplots=16):
+    # Plot image grid with labels
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().float().numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.cpu().numpy()
+
+    # un-normalise
+    if np.max(images[0]) <= 1:
+        images *= 255
+
+    tl = 3  # line thickness
+    tf = max(tl - 1, 1)  # font thickness
+    bs, _, h, w = images.shape  # batch size, _, height, width
+    bs = min(bs, max_subplots)  # limit plot images
+    ns = np.ceil(bs ** 0.5)  # number of subplots (square)
+
+    # Check if we should resize
+    scale_factor = max_size / max(h, w)
+    if scale_factor < 1:
+        h = math.ceil(scale_factor * h)
+        w = math.ceil(scale_factor * w)
+
+    mosaic = np.full((int(ns * h), int(ns * w), 3), 255, dtype=np.uint8)  # init
+    for i, img in enumerate(images):
+        if i == max_subplots:  # if last batch has fewer images than we expect
+            break
+
+        block_x = int(w * (i // ns))
+        block_y = int(h * (i % ns))
+
+        img = img.transpose(1, 2, 0)
+        if scale_factor < 1:
+            img = cv2.resize(img, (w, h))
+
+        mosaic[block_y:block_y + h, block_x:block_x + w, :] = img
+        if len(targets) > 0:
+            image_targets = targets[targets[:, 0] == i]
+            boxes = image_targets[:, 2:10].T
+            classes = image_targets[:, 1].astype('int')
+            labels = image_targets.shape[1] == 10  # labels if no conf column
+            conf = None if labels else image_targets[:, 10]  # check for confidence presence (label vs pred)
+
+            if boxes.shape[1]:
+                if boxes.max() <= 2.:  # if normalized with tolerance 1.0 (large tolerance allows four corners to be out of images)
+                    boxes[0::2] *= w  # scale to pixels
+                    boxes[1::2] *= h
+                elif scale_factor < 1:  # absolute coords need scale if image scales
+                    boxes *= scale_factor
+            boxes[0::2] += block_x
+            boxes[1::2] += block_y
+            for j, box in enumerate(boxes.T):
+                cls = int(classes[j])
+                color = colors(cls)
+                cls = names[cls] if names else cls
+                if labels or conf[j] > 0.25:  # 0.25 conf thresh
+                    label = '%s' % cls if labels else '%s %.1f' % (cls, conf[j])
+                    polygon_plot_one_box(box, mosaic, label=label, color=color, line_thickness=tl)
+
+        # Draw image filename labels
+        if paths:
+            label = Path(paths[i]).name[:40]  # trim to 40 char
+            t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+            cv2.putText(mosaic, label, (block_x + 5, block_y + t_size[1] + 5), 0, tl / 3, [220, 220, 220], thickness=tf,
+                        lineType=cv2.LINE_AA)
+
+        # Image border
+        cv2.rectangle(mosaic, (block_x, block_y), (block_x + w, block_y + h), (255, 255, 255), thickness=3)
+
+    if fname:
+        r = min(1280. / max(h, w) / ns, 1.0)  # ratio to limit image size
+        mosaic = cv2.resize(mosaic, (int(ns * w * r), int(ns * h * r)), interpolation=cv2.INTER_AREA)
+        # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
+        Image.fromarray(mosaic).save(fname)  # PIL save
+    return mosaic
 
 def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
     # Plot LR simulating training for full epochs
@@ -487,3 +581,32 @@ def plot_skeleton_kpts(im, kpts, steps, orig_shape=None):
         if pos2[0] % 640 == 0 or pos2[1] % 640 == 0 or pos2[0]<0 or pos2[1]<0:
             continue
         cv2.line(im, pos1, pos2, (int(r), int(g), int(b)), thickness=2)
+
+def polygon_plot_one_box(x, im, color=(128, 128, 128), label=None, line_thickness=3):
+    """
+        Plots one bounding box on image 'im' using OpenCV
+        im is np.array with shape (W, H, Ch), x is pixel-level xyxyxyxy
+    """
+    
+    assert im.data.contiguous, 'Image not contiguous. Apply np.ascontiguousarray(im) to polygon_plot_one_box() input image.'
+    tl = line_thickness or round(0.002 * (im.shape[0] + im.shape[1]) / 2) + 1  # line/font thickness
+    c = x.cpu().numpy().reshape(-1, 1, 2).astype(np.int32) if isinstance(x, torch.Tensor) else np.array(x).reshape(-1, 1, 2).astype(np.int32)
+    cv2.polylines(im, pts=[c], isClosed=True, color=color, thickness=tl, lineType=cv2.LINE_AA)
+    if label:
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+        c1 = (int(c[:, 0, 0].mean()), int(c[:, 0, 1].mean()))
+        c2 = (int(c1[0] + t_size[0]), int(c1[1] - t_size[1] - 3))
+        im_origin = im.copy()
+        cv2.rectangle(im, c1, c2, color, -1, cv2.LINE_AA)  # filled
+        cv2.putText(im, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+        alpha = 0.5    # opacity of 0.5
+        cv2.addWeighted(im, alpha, im_origin, 1 - alpha, 0, im)
+
+def polygon_output_to_target(output):
+    # Convert model output to target format [batch_id, class_id, x1, y1, x2, y2, x3, y3, x4, y4, conf]
+    targets = []
+    for i, o in enumerate(output):
+        for *box, conf, cls in o.cpu().numpy():
+            targets.append([i, cls, *list(box), conf])
+    return np.array(targets)

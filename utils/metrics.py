@@ -221,3 +221,49 @@ def plot_mc_curve(px, py, save_dir='mc_curve.png', names=(), xlabel='Confidence'
     ax.set_ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
     fig.savefig(Path(save_dir), dpi=250)
+
+class Polygon_ConfusionMatrix(ConfusionMatrix):
+    # Updated version of https://github.com/kaanakan/object_detection_confusion_matrix
+    def __init__(self, nc, conf=0.25, iou_thres=0.45):
+        super(Polygon_ConfusionMatrix, self).__init__(nc, conf, iou_thres)
+
+    def process_batch(self, detections, labels):
+        """
+            Return intersection-over-union (Jaccard index) of polygon boxes.
+            Both sets of boxes are expected to be in (x1, y1, x2, y2, x3, y3, x4, y4) format.
+            Arguments:
+                detections (Array[N, 10]), x1, y1, x2, y2, x3, y3, x4, y4, conf, class
+                labels (Array[M, 9]), class, x1, y1, x2, y2, x3, y3, x4, y4
+            Returns:
+                None, updates confusion matrix accordingly
+        """
+        
+        detections = detections[detections[:, 8] > self.conf]
+        gt_classes = labels[:, 0].int()
+        detection_classes = detections[:, 9].int()
+        iou = general.polygon_box_iou(labels[:, 1:], detections[:, :8], device=detections.device) # iou has shape M x N
+        x = torch.where(iou > self.iou_thres)
+        if x[0].shape[0]:
+            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+            if x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        else:
+            matches = np.zeros((0, 3))
+
+        n = matches.shape[0] > 0
+        m0, m1, _ = matches.transpose().astype(np.int16)
+        for i, gc in enumerate(gt_classes):
+            j = m0 == i
+            if n and sum(j) == 1:
+                self.matrix[detection_classes[m1[j]], gc] += 1  # correct
+            else:
+                self.matrix[self.nc, gc] += 1  # background FP
+
+        if n:
+            for i, dc in enumerate(detection_classes):
+                if not any(m1 == i):
+                    self.matrix[dc, self.nc] += 1  # background FN
+                    

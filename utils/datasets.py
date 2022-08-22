@@ -8,7 +8,7 @@ import random
 import shutil
 import time
 from itertools import repeat
-from multiprocessing.pool import ThreadPool
+from multiprocessing.pool import ThreadPool, Pool
 from pathlib import Path
 from threading import Thread
 
@@ -27,7 +27,7 @@ from torchvision.utils import save_image
 from torchvision.ops import roi_pool, roi_align, ps_roi_pool, ps_roi_align
 
 from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
-    resample_segments, clean_str
+    resample_segments, clean_str, xyxyxyxyn2xyxyxyxy, colorstr
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
@@ -35,6 +35,8 @@ help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
 img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
 vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
 logger = logging.getLogger(__name__)
+
+num_threads = min(8, os.cpu_count()) 
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -63,10 +65,11 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', polygon=False):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+        custom_dataset_class = Polygon_LoadImagesAndLabels if polygon else LoadImagesAndLabels    # POLYGON
+        dataset = custom_dataset_class(path, imgsz, batch_size,
                                       augment=augment,  # augment images
                                       hyp=hyp,  # augmentation hyperparameters
                                       rect=rect,  # rectangular training
@@ -87,7 +90,7 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                         num_workers=nw,
                         sampler=sampler,
                         pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+                        collate_fn=custom_dataset_class.collate_fn4 if (quad and not polygon) else custom_dataset_class.collate_fn)
     return dataloader, dataset
 
 
@@ -661,6 +664,240 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
 
+class Polygon_LoadImagesAndLabels(Dataset):  # for training/testing
+    """
+        Polygon_LoadImagesAndLabels for polygon boxes
+    """
+    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+        self.path = path
+        
+        # albumentation
+        self.albumentations = PolygonAlbumentations() if augment else None
+
+        try:
+            f = []  # image files
+            for p in path if isinstance(path, list) else [path]:
+                p = Path(p)  # os-agnostic
+                if p.is_dir():  # dir
+                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                    # f = list(p.rglob('**/*.*'))  # pathlib
+                elif p.is_file():  # file
+                    with open(p, 'r') as t:
+                        t = t.read().strip().splitlines()
+                        parent = str(p.parent) + os.sep
+                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
+                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
+                else:
+                    raise Exception(f'{prefix}{p} does not exist')
+            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
+            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
+            assert self.img_files, f'{prefix}No images found'
+        except Exception as e:
+            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
+
+        # Check cache
+        self.label_files = img2label_paths(self.img_files)  # labels
+        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
+        if cache_path.is_file():
+            cache, exists = torch.load(cache_path), True  # load
+            if cache.get('hash') != get_hash(self.label_files + self.img_files):
+                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
+        else:
+            cache, exists = self.cache_labels(cache_path, prefix), False  # cache
+
+        # Display cache
+        nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
+        if exists:
+            d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+            tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
+        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
+
+        # Read cache
+        cache.pop('hash')  # remove hash
+        cache.pop('version')  # remove version
+        labels, shapes, self.segments = zip(*cache.values())
+        self.labels = list(labels)
+        self.shapes = np.array(shapes, dtype=np.float64)
+        self.img_files = list(cache.keys())  # update
+        self.label_files = img2label_paths(cache.keys())  # update
+        if single_cls:
+            for x in self.labels:
+                x[:, 0] = 0
+
+        n = len(shapes)  # number of images
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+        self.batch = bi  # batch index of image
+        self.n = n
+        self.indices = range(n)
+
+        # Rectangular Training
+        if self.rect:
+            # Sort by aspect ratio
+            s = self.shapes  # image wh
+            ar = s[:, 1] / s[:, 0]  # aspect ratio
+            irect = ar.argsort()
+            self.img_files = [self.img_files[i] for i in irect]
+            self.label_files = [self.label_files[i] for i in irect]
+            self.labels = [self.labels[i] for i in irect]
+            self.shapes = s[irect]  # wh
+            ar = ar[irect]
+
+            # Set training image shapes
+            shapes = [[1, 1]] * nb
+            for i in range(nb):
+                ari = ar[bi == i]
+                mini, maxi = ari.min(), ari.max()
+                if maxi < 1:
+                    shapes[i] = [maxi, 1]
+                elif mini > 1:
+                    shapes[i] = [1, 1 / mini]
+
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+
+        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
+        self.imgs = [None] * n
+        if cache_images:
+            gb = 0  # Gigabytes of cached images
+            self.img_hw0, self.img_hw = [None] * n, [None] * n
+            results = ThreadPool(num_threads).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))
+            pbar = tqdm(enumerate(results), total=n)
+            for i, x in pbar:
+                self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
+                gb += self.imgs[i].nbytes
+                pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
+            pbar.close()
+
+    def cache_labels(self, path=Path('./labels.cache'), prefix=''):
+        # Cache dataset labels, check images and read shapes
+        x = {}  # dict
+        nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, corrupt
+        desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels..."
+        with Pool(num_threads) as pool:
+            pbar = tqdm(pool.imap_unordered(polygon_verify_image_label, zip(self.img_files, self.label_files, repeat(prefix))),
+                        desc=desc, total=len(self.img_files))
+            for im_file, l, shape, segments, nm_f, nf_f, ne_f, nc_f in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    x[im_file] = [l, shape, segments]
+                pbar.desc = f"{desc}{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+
+        pbar.close()
+        if nf == 0:
+            logging.info(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
+        x['hash'] = get_hash(self.label_files + self.img_files)
+        x['results'] = nf, nm, ne, nc, len(self.img_files)
+        x['version'] = 0.2  # cache version
+        try:
+            torch.save(x, path)  # save cache for next time
+            logging.info(f'{prefix}New cache created: {path}')
+        except Exception as e:
+            logging.info(f'{prefix}WARNING: Cache directory {path.parent} is not writeable: {e}')  # path not writeable
+        return x
+
+    def __len__(self):
+        return len(self.img_files)
+
+    # def __iter__(self):
+    #     self.count = -1
+    #     print('ran dataset iter')
+    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
+    #     return self
+    
+    def __getitem__(self, index):
+        index = self.indices[index]  # linear, shuffled, or image_weights
+
+        hyp = self.hyp
+        mosaic = self.mosaic and random.random() < hyp['mosaic']
+        if mosaic:
+            # Load mosaic
+            img, labels = polygon_load_mosaic(self, index)
+            shapes = None
+
+            # MixUp https://arxiv.org/pdf/1710.09412.pdf
+            if random.random() < hyp['mixup']:
+                img2, labels2 = polygon_load_mosaic(self, random.randint(0, self.n - 1))
+                r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
+                img = (img * r + img2 * (1 - r)).astype(np.uint8)
+                labels = np.concatenate((labels, labels2), 0)
+
+        else:
+            # Load image
+            img, (h0, w0), (h, w) = load_image(self, index)
+
+            # Letterbox
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
+            labels = self.labels[index].copy() 
+            if labels.size:  # normalized format to pixel xyxyxyxy format
+                labels[:, 1:] = xyxyxyxyn2xyxyxyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+        if self.augment:
+            # Augment imagespace
+            if not mosaic:
+                img, labels = polygon_random_perspective(img, labels,
+                                                         degrees=hyp['degrees'],
+                                                         translate=hyp['translate'],
+                                                         scale=hyp['scale'],
+                                                         shear=hyp['shear'],
+                                                         perspective=hyp['perspective'])
+
+            # Augment colorspace
+            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+            # Polygon does not support cutouts
+
+        nL = len(labels)  # number of labels
+        if nL:
+            labels[:, 2::2] /= img.shape[0]  # normalized height 0-1
+            labels[:, 1::2] /= img.shape[1]  # normalized width 0-1
+
+        if self.augment:
+            # albumentation
+            img = self.albumentations(img)
+            
+            # flip up-down for all y
+            if random.random() < hyp['flipud']:
+                img = np.flipud(img)
+                if nL:
+                    labels[:, 2::2] = 1 - labels[:, 2::2]
+
+            # flip left-right for all x
+            if random.random() < hyp['fliplr']:
+                img = np.fliplr(img)
+                if nL:
+                    labels[:, 1::2] = 1 - labels[:, 1::2]
+        # original label shape is (nL, 9), add one column for target image index for build_targets()
+        labels_out = torch.zeros((nL, 10))
+        if nL:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+
+        # Convert
+        img = img.transpose((2, 0, 1))[::-1]  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img)
+
+        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+
+    # Polygon does not support collate_fn4
+    @staticmethod
+    def collate_fn(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
 def load_image(self, index):
@@ -1246,6 +1483,33 @@ def create_folder(path='./new'):
         shutil.rmtree(path)  # delete output folder
     os.makedirs(path)  # make new output folder
 
+class PolygonAlbumentations:
+    # Polygon YOLOv5 Albumentations class (optional, only used if package is installed)
+    def __init__(self):
+        self.transform = None
+        try:
+            import albumentations as A
+
+            self.transform = A.Compose([
+                A.MedianBlur(p=0.05),
+                A.ToGray(p=0.1),
+                A.RandomBrightnessContrast(p=0.35),
+                A.CLAHE(p=0.2),
+                A.InvertImg(p=0.3)],)
+                # Not support for any position change to image
+
+            logging.info(colorstr('albumentations: ') + ', '.join(f'{x}' for x in self.transform.transforms if x.p))
+        except ImportError:  # package not installed, skip
+            pass
+        except Exception as e:
+            logging.info(colorstr('albumentations: ') + f'{e}')
+
+    def __call__(self, im, p=1.0):
+        if self.transform and random.random() < p:
+            new = self.transform(image=im)  # transformed
+            im = new['image']
+        return im
+
 
 def flatten_recursive(path='../coco'):
     # Flatten a recursive directory by bringing all files to top level
@@ -1318,3 +1582,171 @@ def load_segmentations(self, index):
     #print(key)
     # /work/handsomejw66/coco17/
     return self.segs[key]
+
+def polygon_verify_image_label(params):
+    # Verify one image-label pair
+    im_file, lb_file, prefix = params
+    nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, corrupt
+    try:
+        # verify images
+        im = Image.open(im_file)
+        im.verify()  # PIL verify
+        shape = exif_size(im)  # image size
+        segments = []  # instance segments
+        assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+        assert im.format.lower() in img_formats, f'invalid image format {im.format}'
+
+        # verify labels
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            l = np.loadtxt(lb_file, dtype=np.float32)
+            if len(l.shape)==1: l = l[None, :]
+            segments = [x[1:].reshape(-1, 2) for x in l]  # ((x1, y1), (x2, y2), ...)
+            if len(l):
+                assert l.shape[1] == 9, 'labels require 9 columns each'
+                # Common out following lines to enable: polygon corners can be out of images
+                # assert (l >= 0).all(), 'negative labels'
+                # assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
+            else:
+                ne = 1  # label empty
+                l = np.zeros((0, 9), dtype=np.float32)
+        else:
+            nm = 1  # label missing
+            l = np.zeros((0, 9), dtype=np.float32)
+        return im_file, l, shape, segments, nm, nf, ne, nc
+    except Exception as e:
+        nc = 1
+        logging.info(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
+        return [None] * 4 + [nm, nf, ne, nc]
+
+def polygon_random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
+                       border=(0, 0), mosaic=False):
+    """
+        torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
+        targets = [cls, xyxyxyxy]
+    """
+#     To restrict the polygon boxes within images
+#     def restrict(img, new, shape0, padding=(0, 0, 0, 0)):
+#         height, width = shape0
+#         top0, bottom0, left0, right0 = np.ceil(padding[0]), np.floor(padding[1]), np.floor(padding[2]), np.ceil(padding[3])
+#         # keep the original shape of image
+#         if (height/width) < ((height+bottom0+top0)/(width+left0+right0)):
+#             dw = int((height+bottom0+top0)/height*width)-(width+left0+right0)
+#             top, bottom, left, right = map(int, (top0, bottom0, left0+dw/2, right0+dw/2))
+#         else:
+#             dh = int((width+left0+right0)*height/width)-(height+bottom0+top0)
+#             top, bottom, left, right = map(int, (top0+dh/2, bottom0+dh/2, left0, right0))
+#         img = cv2.copyMakeBorder(img, bottom, top, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+#         img = cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
+#         w_r, h_r = width/(width+left+right), height/(height+bottom+top)
+#         new[:, 0::2] = (new[:, 0::2]+left)*w_r
+#         new[:, 1::2] = (new[:, 1::2]+bottom)*h_r
+#         return img, new
+        
+    height = img.shape[0] + border[0] * 2  # shape(h,w,c)
+    width = img.shape[1] + border[1] * 2
+
+    # Center
+    C = np.eye(3)
+    C[0, 2] = -img.shape[1] / 2  # x translation (pixels)
+    C[1, 2] = -img.shape[0] / 2  # y translation (pixels)
+
+    # Perspective
+    P = np.eye(3)
+    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
+    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
+
+    # Rotation and Scale
+    R = np.eye(3)
+    a = random.uniform(-degrees, degrees)
+    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+    s = random.uniform(1 - scale, 1 + scale)
+    # s = 2 ** random.uniform(-scale, scale)
+    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+
+    # Shear
+    S = np.eye(3)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
+
+    # Translation
+    T = np.eye(3)
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
+
+    # Combined rotation matrix
+    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+    image_transformed = False
+
+    # Transform label coordinates
+    n = len(targets)
+    if n:
+        # if using segments: please use general.py::polygon_segment2box
+        # segment is unnormalized np.array([[(x1, y1), (x2, y2), ...], ...])
+        # targets is unnormalized np.array([[class id, x1, y1, x2, y2, ...], ...])
+        new = np.zeros((n, 8))
+        xy = np.ones((n * 4, 3))
+        xy[:, :2] = targets[:, 1:].reshape(n * 4, 2)
+        xy = xy @ M.T  # transform
+        new = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
+        
+        if not mosaic:
+            # Compute Top, Bottom, Left, Right Padding to Include Polygon Boxes inside Image
+            top = max(new[:, 1::2].max().item()-height, 0)
+            bottom = abs(min(new[:, 1::2].min().item(), 0))
+            left = abs(min(new[:, 0::2].min().item(), 0))
+            right = max(new[:, 0::2].max().item()-width, 0)
+            
+            R2 = np.eye(3)
+            r = min(height/(height+top+bottom), width/(width+left+right))
+            R2[:2] = cv2.getRotationMatrix2D(angle=0., center=(0, 0), scale=r)
+            M2 = T @ S @ R @ R2 @ P @ C  # order of operations (right to left) is IMPORTANT
+            
+            if (border[0] != 0) or (border[1] != 0) or (M2 != np.eye(3)).any():  # image changed
+                if perspective:
+                    img = cv2.warpPerspective(img, M2, dsize=(width, height), borderValue=(114, 114, 114))
+                else:  # affine
+                    img = cv2.warpAffine(img, M2[:2], dsize=(width, height), borderValue=(114, 114, 114))
+                image_transformed = True
+                new = np.zeros((n, 8))
+                xy = np.ones((n * 4, 3))
+                xy[:, :2] = targets[:, 1:].reshape(n * 4, 2)
+                xy = xy @ M2.T  # transform
+                new = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
+            # img, new = restrict(img, new, (height, width), (top, bottom, left, right))
+        
+        # Use the following two lines can result in slightly tilting for few labels.
+        # new[:, 0::2] = new[:, 0::2].clip(0., width)
+        # new[:, 1::2] = new[:, 1::2].clip(0., height)
+        # If use following codes instead, can mitigate tilting problems, but result in few label exceeding problems.
+        cx, cy = new[:, 0::2].mean(-1), new[:, 1::2].mean(-1)
+        new[(cx>width)|(cx<-0.)|(cy>height)|(cy<-0.)] = 0.
+        
+        # filter candidates
+        # 0.1 for axis-aligned rectangle, 0.01 for segmentation, so choose intermediate 0.08
+        i = polygon_box_candidates(box1=targets[:, 1:].T * s, box2=new.T, area_thr=0.08) 
+        targets = targets[i]
+        targets[:, 1:] = new[i]
+        
+    if not image_transformed:
+        M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+        if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
+            if perspective:
+                img = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(114, 114, 114))
+            else:  # affine
+                img = cv2.warpAffine(img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+            image_transformed = True
+        
+    return img, targets
+
+def polygon_box_candidates(box1, box2, wh_thr=3, ar_thr=20, area_thr=0.1, eps=1e-16):
+    """
+        box1(8,n), box2(8,n)
+        Use the minimum bounding box as the approximation to polygon
+        Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
+    """
+    w1, h1 = box1[0::2].max(axis=0)-box1[0::2].min(axis=0), box1[1::2].max(axis=0)-box1[1::2].min(axis=0)
+    w2, h2 = box2[0::2].max(axis=0)-box2[0::2].min(axis=0), box2[1::2].max(axis=0)-box2[1::2].min(axis=0)
+    ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
+    return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr)  # candidates
