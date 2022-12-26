@@ -1,0 +1,9 @@
+data/UCAS50/images/val/102.png
+data/UCAS50/images/val/1099.png
+data/UCAS50/images/val/1162.png
+data/UCAS50/images/val/1282.png
+data/UCAS50/images/val/1507.png
+data/UCAS50/images/val/287.png
+data/UCAS50/images/val/608.png
+data/UCAS50/images/val/804.png
+data/UCAS50/images/val/964.png
